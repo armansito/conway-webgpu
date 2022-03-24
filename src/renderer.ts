@@ -1,15 +1,13 @@
-import shaderCode from './shaders/shaders.wgsl';
+import drawShaderCode from './shaders/draw.wgsl';
 
 // Position Vertex Buffer Data
 const positions = new Float32Array([
-    1.0, -1.0, 0.0,
-   -1.0, -1.0, 0.0,
-   -1.0,  1.0, 0.0,
-    1.0,  1.0, 0.0
+    1.0, -1.0, 0.0, -1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 1.0, 1.0, 0.0
 ]);
 
 // Index Buffer Data
-const indices = new Uint16Array([ 0, 3, 1, 2 ]);
+const indices = new Uint16Array([0, 3, 1, 2]);
+const gridWidth = 32;
 
 export default class Renderer {
     canvas: HTMLCanvasElement;
@@ -21,20 +19,30 @@ export default class Renderer {
 
     // Frame Backings
     context: GPUCanvasContext;
-    colorTexture: GPUTexture;
-    colorTextureView: GPUTextureView;
 
-    // Resources
+    // Vertex data for a viewport-sized quad.
     positionBuffer: GPUBuffer;
     indexBuffer: GPUBuffer;
+    uniformBuffer: GPUBuffer;
+
+    // The cells of the simulation. The buffers represent the previous and current iterations,
+    // respectively.
+    cellBuffers: [GPUBuffer, GPUBuffer];
+
+    // Pipeline description
     shaderModule: GPUShaderModule;
-    pipeline: GPURenderPipeline;
+
+    // Render stage
+    renderPipeline: GPURenderPipeline;
+    renderPassDescriptor: GPURenderPassDescriptor;
+    renderBindGroup: GPUBindGroup;
 
     commandEncoder: GPUCommandEncoder;
     passEncoder: GPURenderPassEncoder;
 
     constructor(canvas) {
         this.canvas = canvas;
+        this.cellBuffers = [undefined, undefined];
     }
 
     // Start the rendering engine
@@ -44,6 +52,10 @@ export default class Renderer {
             await this.initializeResources();
             this.render();
         }
+    }
+
+    onResize() {
+        this.resizeBackings();
     }
 
     // Initialize WebGPU
@@ -71,90 +83,151 @@ export default class Renderer {
         return true;
     }
 
-    // Initialize buffers, shaders, pipeline
-    async initializeResources() {
-        // Buffers
-        const createBuffer = (
-            arr: Float32Array | Uint16Array,
-            usage: number
-        ) => {
-            // Align to 4 bytes (thanks @chrimsonite)
-            let desc = {
-                size: (arr.byteLength + 3) & ~3,
-                usage,
-                mappedAtCreation: true
-            };
-            let buffer = this.device.createBuffer(desc);
-            const writeArray =
-                arr instanceof Uint16Array
-                    ? new Uint16Array(buffer.getMappedRange())
-                    : new Float32Array(buffer.getMappedRange());
-            writeArray.set(arr);
-            buffer.unmap();
-            return buffer;
+    private createBuffer(
+        arr: Float32Array | Uint32Array | Uint16Array,
+        usage: number
+    ) {
+        // Align to 4 bytes (thanks @chrimsonite)
+        let desc = {
+            size: (arr.byteLength + 3) & ~3,
+            usage,
+            mappedAtCreation: true
         };
+        let buffer = this.device.createBuffer(desc);
+        const writeArray =
+            arr instanceof Uint16Array
+                ? new Uint16Array(buffer.getMappedRange())
+                : arr instanceof Uint32Array
+                ? new Uint32Array(buffer.getMappedRange())
+                : new Float32Array(buffer.getMappedRange());
+        writeArray.set(arr);
+        buffer.unmap();
+        return buffer;
+    }
 
-        this.positionBuffer = createBuffer(positions, GPUBufferUsage.VERTEX);
-        this.indexBuffer = createBuffer(indices, GPUBufferUsage.INDEX);
+    private initializeCellBuffers() {
+        let cells = new Uint32Array(gridWidth * gridWidth);
+        for (var i = 0; i < cells.length; i++) {
+            cells[i] = i % 2;
+        }
 
-        // Shaders
-        this.shaderModule = this.device.createShaderModule({
-            code: shaderCode
-        });
+        for (var i = 0; i < 2; i++) {
+            this.cellBuffers[i] = this.createBuffer(
+                cells,
+                GPUBufferUsage.STORAGE | GPUBufferUsage.FRAGMENT
+            );
+        }
+    }
 
-        // Graphics Pipeline
-
-        // Input Assembly
-        const positionAttribDesc: GPUVertexAttribute = {
-            shaderLocation: 0, // location(0)
-            offset: 0,
-            format: 'float32x3'
-        };
-        const positionBufferDesc: GPUVertexBufferLayout = {
-            attributes: [positionAttribDesc],
-            arrayStride: 4 * 3, // sizeof(float) * 3
-            stepMode: 'vertex'
-        };
-
-        // Uniform Data
-        const pipelineLayoutDesc = { bindGroupLayouts: [] };
-        const layout = this.device.createPipelineLayout(pipelineLayoutDesc);
-
-        // Shader Stages
+    private initializeRenderPipeline() {
+        // Render stages
         const vertex: GPUVertexState = {
             module: this.shaderModule,
             entryPoint: 'vert_stage',
-            buffers: [positionBufferDesc]
+            buffers: [
+                // GPUVertexBufferLayout
+                {
+                    attributes: [
+                        // GPUVertexAttribute
+                        {
+                            shaderLocation: 0,
+                            offset: 0,
+                            format: 'float32x3'
+                        }
+                    ],
+                    arrayStride: 4 * 3, // sizeof(float) * 3
+                    stepMode: 'vertex'
+                }
+            ]
         };
-
-        // Color/Blend State
-        const colorState: GPUColorTargetState = {
-            format: 'bgra8unorm'
-        };
-
         const fragment: GPUFragmentState = {
             module: this.shaderModule,
             entryPoint: 'frag_stage',
-            targets: [colorState]
+            targets: [{ format: 'bgra8unorm' }]
         };
-
-        // Rasterization
-        const primitive: GPUPrimitiveState = {
-            frontFace: 'cw',
-            cullMode: 'none',
-            topology: 'triangle-strip',
-            stripIndexFormat: 'uint16',
-        };
-
-        const pipelineDesc: GPURenderPipelineDescriptor = {
-            layout,
-
+        const renderBindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'uniform' }
+                },
+                {
+                    binding: 1,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'read-only-storage' }
+                }
+            ]
+        });
+        this.renderBindGroup = this.device.createBindGroup({
+            layout: renderBindGroupLayout,
+            entries: [
+                {
+                    binding: 0,
+                    resource: {
+                        buffer: this.uniformBuffer,
+                        size: 4 // sizeof(uint32)
+                    }
+                },
+                {
+                    binding: 1,
+                    resource: {
+                        // TODO: need to swap buffers every frame
+                        buffer: this.cellBuffers[0],
+                        size: 4 * gridWidth * gridWidth
+                    }
+                }
+            ]
+        });
+        this.renderPipeline = this.device.createRenderPipeline({
+            // GPURenderPipelineDescriptor
+            layout: this.device.createPipelineLayout({
+                bindGroupLayouts: [renderBindGroupLayout]
+            }),
             vertex,
             fragment,
+            primitive: /* GPUPrimitiveState */ {
+                frontFace: 'cw',
+                cullMode: 'none',
+                topology: 'triangle-strip',
+                stripIndexFormat: 'uint16'
+            }
+        });
 
-            primitive,
+        // Define and store the render pass descriptor here to reuse it in the draw loop below.
+        // The `view` property gets reassigned every frame to the current render target in the
+        // swapchain.
+        this.renderPassDescriptor = {
+            colorAttachments: [
+                {
+                    view: undefined,
+                    clearValue: { r: 0.2, g: 0.2, b: 0.2, a: 1 },
+                    loadOp: 'clear',
+                    storeOp: 'store'
+                }
+            ]
         };
-        this.pipeline = this.device.createRenderPipeline(pipelineDesc);
+    }
+
+    // Initialize buffers, shaders, pipeline
+    async initializeResources() {
+        this.initializeCellBuffers();
+        this.uniformBuffer = this.createBuffer(
+            new Uint32Array([gridWidth]),
+            GPUBufferUsage.UNIFORM
+        );
+        this.positionBuffer = this.createBuffer(
+            positions,
+            GPUBufferUsage.VERTEX
+        );
+        this.indexBuffer = this.createBuffer(indices, GPUBufferUsage.INDEX);
+
+        // Shaders
+        this.shaderModule = this.device.createShaderModule({
+            code: drawShaderCode
+        });
+
+        this.initializeRenderPipeline();
     }
 
     // Resize swapchain, frame buffer attachments
@@ -162,48 +235,27 @@ export default class Renderer {
         // Swapchain
         if (!this.context) {
             this.context = this.canvas.getContext('webgpu');
-            const canvasConfig: GPUCanvasConfiguration = {
-                device: this.device,
-                format: 'bgra8unorm',
-                usage:
-                    GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
-            };
-            this.context.configure(canvasConfig);
         }
+
+        var presentationSize = [this.canvas.width, this.canvas.height];
+        const canvasConfig: GPUCanvasConfiguration = {
+            device: this.device,
+            format: 'bgra8unorm',
+            size: presentationSize
+        };
+        this.context.configure(canvasConfig);
     }
 
     // Write commands to send to the GPU
     encodeCommands() {
-        let colorAttachment: GPURenderPassColorAttachment = {
-            view: this.colorTextureView,
-            loadOp: 'clear',
-            clearValue: { r: 0.2, g: 0.2, b: 0.2, a: 1 },
-            storeOp: 'store'
-        };
-
-        const renderPassDesc: GPURenderPassDescriptor = {
-            colorAttachments: [colorAttachment],
-        };
-
         this.commandEncoder = this.device.createCommandEncoder();
 
-        // 🖌️ Encode drawing commands
-        this.passEncoder = this.commandEncoder.beginRenderPass(renderPassDesc);
-        this.passEncoder.setPipeline(this.pipeline);
-        this.passEncoder.setViewport(
-            0,
-            0,
-            this.canvas.width,
-            this.canvas.height,
-            0,
-            1
+        // Encode drawing commands
+        this.passEncoder = this.commandEncoder.beginRenderPass(
+            this.renderPassDescriptor
         );
-        this.passEncoder.setScissorRect(
-            0,
-            0,
-            this.canvas.width,
-            this.canvas.height
-        );
+        this.passEncoder.setPipeline(this.renderPipeline);
+        this.passEncoder.setBindGroup(0, this.renderBindGroup);
         this.passEncoder.setVertexBuffer(0, this.positionBuffer);
         this.passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
         this.passEncoder.drawIndexed(4);
@@ -214,8 +266,9 @@ export default class Renderer {
 
     render = () => {
         // Acquire next image from context
-        this.colorTexture = this.context.getCurrentTexture();
-        this.colorTextureView = this.colorTexture.createView();
+        this.renderPassDescriptor.colorAttachments[0].view = this.context
+            .getCurrentTexture()
+            .createView();
 
         // Write and submit commands to queue
         this.encodeCommands();
