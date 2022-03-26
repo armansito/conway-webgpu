@@ -10,11 +10,16 @@ function setCanvasSize(canvas) {
 const canvas = document.getElementById('gfx') as HTMLCanvasElement;
 setCanvasSize(canvas);
 
-const renderer = new Renderer(canvas);
+if (!navigator.gpu) {
+    document.getElementById('error').style.display = 'block';
+    canvas.style.display = 'none';
+} else {
+    const renderer = new Renderer(canvas);
 
-window.onresize = function () {
-    setCanvasSize(canvas);
-    renderer.onResize();
-};
+    window.onresize = function () {
+        setCanvasSize(canvas);
+        renderer.onResize();
+    };
 
-renderer.start();
+    renderer.start();
+}

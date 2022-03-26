@@ -2,7 +2,7 @@
 <html lang="en-US">
   <head>
     <meta charset="UTF-8" />
-    <title>Conway's Game of Life - WebGPU</title>
+    <title>Game of Life - WebGPU</title>
     <style>
       html,
       body {
@@ -19,10 +19,17 @@
         align-items: center;
         justify-content: center;
       }
+      p {
+        color: white;
+        display: none;
+        font-family: sans-serif;
+        font-size: xx-large;
+      }
     </style>
   </head>
   <body>
     <canvas id="gfx"></canvas>
+    <p id="error">WebGPU is not supported</p>
     <script type="text/javascript" src="dist/main.js"></script>
   </body>
 </html>

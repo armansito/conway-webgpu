@@ -1,3 +1,4 @@
+import computeShaderCode from './shaders/compute.wgsl';
 import drawShaderCode from './shaders/draw.wgsl';
 
 // Position Vertex Buffer Data
@@ -7,7 +8,8 @@ const positions = new Float32Array([
 
 // Index Buffer Data
 const indices = new Uint16Array([0, 3, 1, 2]);
-const gridWidth = 32;
+const gridWidth = 64;
+const gridSize = gridWidth * gridWidth;
 
 export default class Renderer {
     canvas: HTMLCanvasElement;
@@ -15,7 +17,6 @@ export default class Renderer {
     // ⚙️ API Data Structures
     adapter: GPUAdapter;
     device: GPUDevice;
-    queue: GPUQueue;
 
     // Frame Backings
     context: GPUCanvasContext;
@@ -26,23 +27,34 @@ export default class Renderer {
     uniformBuffer: GPUBuffer;
 
     // The cells of the simulation. The buffers represent the previous and current iterations,
-    // respectively.
+    // respectively. The buffers are bound to the render and compute stages using two bind groups
+    // to handle double buffering.
     cellBuffers: [GPUBuffer, GPUBuffer];
+    computeBindGroups: [GPUBindGroup, GPUBindGroup];
+    renderBindGroups: [GPUBindGroup, GPUBindGroup];
 
-    // Pipeline description
-    shaderModule: GPUShaderModule;
+    // Shaders
+    drawShader: GPUShaderModule;
+    computeShader: GPUShaderModule;
+
+    // Compute stage
+    computePipeline: GPUComputePipeline;
 
     // Render stage
     renderPipeline: GPURenderPipeline;
     renderPassDescriptor: GPURenderPassDescriptor;
-    renderBindGroup: GPUBindGroup;
 
-    commandEncoder: GPUCommandEncoder;
-    passEncoder: GPURenderPassEncoder;
+    // The current loop step
+    step: number;
+    last_frame_timestamp: number;
 
     constructor(canvas) {
         this.canvas = canvas;
         this.cellBuffers = [undefined, undefined];
+        this.computeBindGroups = [undefined, undefined];
+        this.renderBindGroups = [undefined, undefined];
+        this.step = 0;
+        this.last_frame_timestamp = 0;
     }
 
     // Start the rendering engine
@@ -50,7 +62,7 @@ export default class Renderer {
         if (await this.initializeAPI()) {
             this.resizeBackings();
             await this.initializeResources();
-            this.render();
+            this.render(0);
         }
     }
 
@@ -72,9 +84,6 @@ export default class Renderer {
 
             // Logical Device
             this.device = await this.adapter.requestDevice();
-
-            // Queue
-            this.queue = this.device.queue;
         } catch (e) {
             console.error(e);
             return false;
@@ -106,10 +115,52 @@ export default class Renderer {
     }
 
     private initializeCellBuffers() {
-        let cells = new Uint32Array(gridWidth * gridWidth);
-        for (var i = 0; i < cells.length; i++) {
-            cells[i] = i % 2;
-        }
+        let cells = new Uint32Array(gridSize);
+
+        // Gosper's Glider Gun see:
+        //   * https://conwaylife.com/wiki/Gosper_glider_gun)
+        //   * https://conwaylife.com/w/images/9/9f/Gosperglidergun.png
+        cells[gridWidth * 5 + 1] = 1;
+        cells[gridWidth * 5 + 2] = 1;
+        cells[gridWidth * 6 + 1] = 1;
+        cells[gridWidth * 6 + 2] = 1;
+
+        cells[gridWidth * 3 + 13] = 1;
+        cells[gridWidth * 3 + 14] = 1;
+        cells[gridWidth * 4 + 12] = 1;
+        cells[gridWidth * 5 + 11] = 1;
+        cells[gridWidth * 6 + 11] = 1;
+        cells[gridWidth * 7 + 11] = 1;
+        cells[gridWidth * 8 + 12] = 1;
+        cells[gridWidth * 9 + 13] = 1;
+        cells[gridWidth * 9 + 14] = 1;
+
+        cells[gridWidth * 6 + 15] = 1;
+        cells[gridWidth * 4 + 16] = 1;
+        cells[gridWidth * 8 + 16] = 1;
+        cells[gridWidth * 5 + 17] = 1;
+        cells[gridWidth * 6 + 17] = 1;
+        cells[gridWidth * 7 + 17] = 1;
+        cells[gridWidth * 6 + 18] = 1;
+
+        cells[gridWidth * 3 + 21] = 1;
+        cells[gridWidth * 4 + 21] = 1;
+        cells[gridWidth * 5 + 21] = 1;
+        cells[gridWidth * 3 + 22] = 1;
+        cells[gridWidth * 4 + 22] = 1;
+        cells[gridWidth * 5 + 22] = 1;
+        cells[gridWidth * 2 + 23] = 1;
+        cells[gridWidth * 6 + 23] = 1;
+
+        cells[gridWidth * 1 + 25] = 1;
+        cells[gridWidth * 2 + 25] = 1;
+        cells[gridWidth * 6 + 25] = 1;
+        cells[gridWidth * 7 + 25] = 1;
+
+        cells[gridWidth * 3 + 35] = 1;
+        cells[gridWidth * 4 + 35] = 1;
+        cells[gridWidth * 3 + 36] = 1;
+        cells[gridWidth * 4 + 36] = 1;
 
         for (var i = 0; i < 2; i++) {
             this.cellBuffers[i] = this.createBuffer(
@@ -119,10 +170,73 @@ export default class Renderer {
         }
     }
 
+    private initializeComputePipeline() {
+        const computeBindGroupLayout = this.device.createBindGroupLayout({
+            entries: [
+                {
+                    binding: 0,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform' }
+                },
+                {
+                    // source buffer for the current generation
+                    binding: 1,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'read-only-storage' }
+                },
+                {
+                    // destination buffer for the next generation
+                    binding: 2,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'storage' }
+                }
+            ]
+        });
+        for (var i = 0; i < 2; i++) {
+            this.computeBindGroups[i] = this.device.createBindGroup({
+                layout: computeBindGroupLayout,
+                entries: [
+                    {
+                        binding: 0,
+                        resource: {
+                            buffer: this.uniformBuffer,
+                            size: 4 // sizeof(int32)
+                        }
+                    },
+                    {
+                        // source buffer for the current generation
+                        binding: 1,
+                        resource: {
+                            buffer: this.cellBuffers[i],
+                            size: 4 * gridSize
+                        }
+                    },
+                    {
+                        // destination buffer for the next generation
+                        binding: 2,
+                        resource: {
+                            buffer: this.cellBuffers[(i + 1) % 2],
+                            size: 4 * gridSize
+                        }
+                    }
+                ]
+            });
+        }
+        this.computePipeline = this.device.createComputePipeline({
+            layout: this.device.createPipelineLayout({
+                bindGroupLayouts: [computeBindGroupLayout]
+            }),
+            compute: {
+                module: this.computeShader,
+                entryPoint: 'main'
+            }
+        });
+    }
+
     private initializeRenderPipeline() {
         // Render stages
         const vertex: GPUVertexState = {
-            module: this.shaderModule,
+            module: this.drawShader,
             entryPoint: 'vert_stage',
             buffers: [
                 // GPUVertexBufferLayout
@@ -141,7 +255,7 @@ export default class Renderer {
             ]
         };
         const fragment: GPUFragmentState = {
-            module: this.shaderModule,
+            module: this.drawShader,
             entryPoint: 'frag_stage',
             targets: [{ format: 'bgra8unorm' }]
         };
@@ -159,26 +273,27 @@ export default class Renderer {
                 }
             ]
         });
-        this.renderBindGroup = this.device.createBindGroup({
-            layout: renderBindGroupLayout,
-            entries: [
-                {
-                    binding: 0,
-                    resource: {
-                        buffer: this.uniformBuffer,
-                        size: 4 // sizeof(uint32)
+        for (var i = 0; i < 2; i++) {
+            this.renderBindGroups[i] = this.device.createBindGroup({
+                layout: renderBindGroupLayout,
+                entries: [
+                    {
+                        binding: 0,
+                        resource: {
+                            buffer: this.uniformBuffer,
+                            size: 4 // sizeof(uint32)
+                        }
+                    },
+                    {
+                        binding: 1,
+                        resource: {
+                            buffer: this.cellBuffers[i],
+                            size: 4 * gridSize
+                        }
                     }
-                },
-                {
-                    binding: 1,
-                    resource: {
-                        // TODO: need to swap buffers every frame
-                        buffer: this.cellBuffers[0],
-                        size: 4 * gridWidth * gridWidth
-                    }
-                }
-            ]
-        });
+                ]
+            });
+        }
         this.renderPipeline = this.device.createRenderPipeline({
             // GPURenderPipelineDescriptor
             layout: this.device.createPipelineLayout({
@@ -223,10 +338,14 @@ export default class Renderer {
         this.indexBuffer = this.createBuffer(indices, GPUBufferUsage.INDEX);
 
         // Shaders
-        this.shaderModule = this.device.createShaderModule({
+        this.computeShader = this.device.createShaderModule({
+            code: computeShaderCode
+        });
+        this.drawShader = this.device.createShaderModule({
             code: drawShaderCode
         });
 
+        this.initializeComputePipeline();
         this.initializeRenderPipeline();
     }
 
@@ -248,32 +367,47 @@ export default class Renderer {
 
     // Write commands to send to the GPU
     encodeCommands() {
-        this.commandEncoder = this.device.createCommandEncoder();
+        const commandEncoder = this.device.createCommandEncoder();
+
+        // Encode compute commands
+        {
+            const passEncoder = commandEncoder.beginComputePass();
+            passEncoder.setPipeline(this.computePipeline);
+            passEncoder.setBindGroup(0, this.computeBindGroups[this.step % 2]);
+            passEncoder.dispatch(gridSize);
+            passEncoder.end();
+        }
 
         // Encode drawing commands
-        this.passEncoder = this.commandEncoder.beginRenderPass(
-            this.renderPassDescriptor
-        );
-        this.passEncoder.setPipeline(this.renderPipeline);
-        this.passEncoder.setBindGroup(0, this.renderBindGroup);
-        this.passEncoder.setVertexBuffer(0, this.positionBuffer);
-        this.passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
-        this.passEncoder.drawIndexed(4);
-        this.passEncoder.end();
+        {
+            const passEncoder = commandEncoder.beginRenderPass(
+                this.renderPassDescriptor
+            );
+            passEncoder.setPipeline(this.renderPipeline);
+            passEncoder.setBindGroup(0, this.renderBindGroups[this.step % 2]);
+            passEncoder.setVertexBuffer(0, this.positionBuffer);
+            passEncoder.setIndexBuffer(this.indexBuffer, 'uint16');
+            passEncoder.drawIndexed(4);
+            passEncoder.end();
+        }
 
-        this.queue.submit([this.commandEncoder.finish()]);
+        this.device.queue.submit([commandEncoder.finish()]);
+        ++this.step;
     }
 
-    render = () => {
-        // Acquire next image from context
-        this.renderPassDescriptor.colorAttachments[0].view = this.context
-            .getCurrentTexture()
-            .createView();
+    render = (now) => {
+        const last = this.last_frame_timestamp;
+        if (last == 0 || now - last >= 100) {
+            this.last_frame_timestamp = now;
 
-        // Write and submit commands to queue
-        this.encodeCommands();
+            // Acquire next image from context
+            this.renderPassDescriptor.colorAttachments[0].view = this.context
+                .getCurrentTexture()
+                .createView();
 
-        // Refresh canvas
+            // Write and submit commands to queue
+            this.encodeCommands();
+        }
         requestAnimationFrame(this.render);
     };
 }
