@@ -281,7 +281,7 @@ export default class Renderer {
                         binding: 0,
                         resource: {
                             buffer: this.uniformBuffer,
-                            size: 4 // sizeof(uint32)
+                            size: 8 // 2 * sizeof(uint32)
                         }
                     },
                     {
@@ -328,7 +328,7 @@ export default class Renderer {
     async initializeResources() {
         this.initializeCellBuffers();
         this.uniformBuffer = this.createBuffer(
-            new Uint32Array([gridWidth]),
+            new Uint32Array([gridWidth, this.canvas.width]),
             GPUBufferUsage.UNIFORM
         );
         this.positionBuffer = this.createBuffer(

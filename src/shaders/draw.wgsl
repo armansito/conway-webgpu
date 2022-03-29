@@ -2,27 +2,25 @@ struct Grid {
     cells: array<u32>;
 };
 
-@binding(0) @group(0) var<uniform> gridWidth: u32;
-@binding(1) @group(0) var<storage, read> grid: Grid;
-
-// Vertex stage output
-struct VSOut {
-    @builtin(position) pos: vec4<f32>;
-    @location(0) fragCoord: vec2<f32>;
+struct Uniforms {
+    gridWidth: u32;
+    imageWidth: u32;
 };
 
+@binding(0) @group(0) var<uniform> uniforms: Uniforms;
+@binding(1) @group(0) var<storage, read> grid: Grid;
+
 @stage(vertex)
-fn vert_stage(@location(0) inPos: vec3<f32>) -> VSOut {
-    var vsOut: VSOut;
-    vsOut.pos = vec4<f32>(inPos, 1.0);
-    vsOut.fragCoord = (inPos.xy + 1.) * .5;
-    return vsOut;
+fn vert_stage(@location(0) inPos: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(inPos, 1.0);
 }
 
 @stage(fragment)
-fn frag_stage(@location(0) fc: vec2<f32>) -> @location(0) vec4<f32> {
+fn frag_stage(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     // Flip y, so that the top-left corner is the origin.
-    let fragCoord = vec2<f32>(0.0, 1.0) - fc;
+    let fragCoord = pos.xy / f32(uniforms.imageWidth);
+    let gridWidth = uniforms.gridWidth;
+
     let coords = vec2<u32>(floor(abs(fragCoord) * (f32(gridWidth) - 0.001)));
     let idx = coords.y * gridWidth + coords.x;
     if (grid.cells[idx] == 0u) {
